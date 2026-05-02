@@ -1,0 +1,18 @@
+# LLM
+openai>=1.30.0
+
+# Embedding & Vector
+sentence-transformers>=2.6.0
+faiss-cpu>=1.7.4
+
+# Document Parsing
+pdfplumber>=0.10.0
+python-docx>=1.1.0
+
+# Web UI
+streamlit>=1.37.0
+
+# Utils
+python-dotenv>=1.0.0
+rich>=13.7.0
+tiktoken>=0.6.0
