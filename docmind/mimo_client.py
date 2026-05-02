@@ -3,17 +3,29 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Generator
 
-from openai import OpenAI
+from openai import OpenAI, APIError, APIConnectionError, RateLimitError
 
 from docmind.config import Config
 
 logger = logging.getLogger(__name__)
 
 
+class MimoAPIError(Exception):
+    """MiMo API 调用异常"""
+
+    def __init__(self, message: str, original_error: Exception | None = None):
+        self.original_error = original_error
+        super().__init__(message)
+
+
 class MimoClient:
     """MiMo Token Plan API 封装"""
+
+    MAX_RETRIES = 2
+    RETRY_DELAY = 1.0  # 秒
 
     def __init__(self):
         self.client = OpenAI(
@@ -33,7 +45,7 @@ class MimoClient:
         max_tokens: int = 4096,
         json_mode: bool = False,
     ) -> str:
-        """同步聊天，返回 assistant 文本"""
+        """同步聊天，返回 assistant 文本，含重试逻辑"""
         kwargs: dict = dict(
             model=model or self.model_pro,
             messages=messages,
@@ -43,8 +55,34 @@ class MimoClient:
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
-        resp = self.client.chat.completions.create(**kwargs)
-        return resp.choices[0].message.content or ""
+        last_error = None
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                resp = self.client.chat.completions.create(**kwargs)
+                content = resp.choices[0].message.content
+                return content or ""
+            except RateLimitError as e:
+                last_error = e
+                if attempt < self.MAX_RETRIES:
+                    delay = self.RETRY_DELAY * (2 ** attempt)
+                    logger.warning("Rate limit, %.1fs 后重试 (%d/%d)", delay, attempt + 1, self.MAX_RETRIES)
+                    time.sleep(delay)
+                else:
+                    raise MimoAPIError("API 请求频率超限，请稍后再试", e)
+            except APIConnectionError as e:
+                last_error = e
+                if attempt < self.MAX_RETRIES:
+                    delay = self.RETRY_DELAY * (2 ** attempt)
+                    logger.warning("连接失败, %.1fs 后重试 (%d/%d)", delay, attempt + 1, self.MAX_RETRIES)
+                    time.sleep(delay)
+                else:
+                    raise MimoAPIError("无法连接 MiMo API，请检查网络", e)
+            except APIError as e:
+                raise MimoAPIError(f"API 错误: {e.message}", e)
+            except Exception as e:
+                raise MimoAPIError(f"未知错误: {e}", e)
+
+        raise MimoAPIError("请求失败", last_error)
 
     def chat_stream(
         self,
@@ -54,17 +92,26 @@ class MimoClient:
         max_tokens: int = 4096,
     ) -> Generator[str, None, None]:
         """流式聊天，逐 token 返回"""
-        stream = self.client.chat.completions.create(
-            model=model or self.model_pro,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-        )
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-            if delta.content:
-                yield delta.content
+        try:
+            stream = self.client.chat.completions.create(
+                model=model or self.model_pro,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield delta.content
+        except RateLimitError as e:
+            raise MimoAPIError("API 请求频率超限，请稍后再试", e)
+        except APIConnectionError as e:
+            raise MimoAPIError("无法连接 MiMo API，请检查网络", e)
+        except APIError as e:
+            raise MimoAPIError(f"API 错误: {e.message}", e)
+        except Exception as e:
+            raise MimoAPIError(f"未知错误: {e}", e)
 
     # ── 高级封装 ──
 
@@ -103,10 +150,6 @@ class MimoClient:
             temperature=temperature,
             max_tokens=4096,
         )
-
-    def count_tokens(self, text: str) -> int:
-        """粗略估算 token 数（中文约 1.5 字/token）"""
-        return int(len(text) * 0.7)
 
 
 # 全局单例

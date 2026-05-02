@@ -14,5 +14,3 @@ streamlit>=1.37.0
 
 # Utils
 python-dotenv>=1.0.0
-rich>=13.7.0
-tiktoken>=0.6.0

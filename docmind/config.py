@@ -26,6 +26,14 @@ class Config:
     DATA_DIR: Path = BASE_DIR / "data"
     UPLOAD_DIR: Path = DATA_DIR / "uploads"
     INDEX_DIR: Path = DATA_DIR / "index"
+    HISTORY_DIR: Path = DATA_DIR / "history"
+
+    # ── Limits ──
+    MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
+    MAX_HISTORY_TURNS: int = int(os.getenv("MAX_HISTORY_TURNS", "5"))
+
+    # ── Cleanup ──
+    TEMP_CLEANUP: bool = os.getenv("TEMP_CLEANUP", "true").lower() == "true"
 
     # ── Server ──
     HOST: str = os.getenv("HOST", "0.0.0.0")
@@ -34,7 +42,7 @@ class Config:
     @classmethod
     def ensure_dirs(cls):
         """确保必要目录存在"""
-        for d in [cls.UPLOAD_DIR, cls.INDEX_DIR]:
+        for d in [cls.UPLOAD_DIR, cls.INDEX_DIR, cls.HISTORY_DIR]:
             d.mkdir(parents=True, exist_ok=True)
 
 

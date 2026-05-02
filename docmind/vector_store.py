@@ -1,9 +1,9 @@
-"""FAISS 向量存储：文档索引 + 相似度检索"""
+"""FAISS 向量存储：文档索引 + 相似度检索 + 文档管理"""
 from __future__ import annotations
 
-import json
 import logging
 import pickle
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import faiss
@@ -11,9 +11,19 @@ import numpy as np
 
 from docmind.config import Config
 from docmind.document_parser import Chunk
-from docmind.embeddings import embed_texts, embed_query, get_embedding_dim
+from docmind.embeddings import embed_texts, embed_query
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DocumentMeta:
+    """单文档统计信息"""
+    source: str
+    chunk_count: int
+    total_chars: int
+    file_size: int = 0  # bytes
+    indexed_at: str = ""
 
 
 class VectorStore:
@@ -23,6 +33,7 @@ class VectorStore:
         self.index: faiss.IndexFlatIP | None = None
         self.chunks: list[Chunk] = []
         self._dim: int | None = None
+        self.source_index: dict[str, list[int]] = {}  # source -> [chunk indices]
 
     # ── 索引构建 ──
 
@@ -39,27 +50,96 @@ class VectorStore:
         vectors = embed_texts(texts)
         self._dim = vectors.shape[1]
 
-        # 使用内积相似度（向量已归一化，等价于余弦相似度）
         self.index = faiss.IndexFlatIP(self._dim)
         self.index.add(vectors)
 
+        self._rebuild_source_index()
         logger.info("索引构建完成: %d 条, 维度 %d", self.index.ntotal, self._dim)
 
     def add_chunks(self, chunks: list[Chunk]) -> None:
-        """增量添加文档分块"""
+        """增量添加文档分块（自动跳过已存在的文档）"""
         if not chunks:
             return
 
-        texts = [c.content for c in chunks]
+        # 去重：跳过已索引的文档
+        new_chunks = [c for c in chunks if not self.has_source(c.source)]
+        if not new_chunks:
+            logger.info("所有文档已索引，跳过")
+            return
+
+        texts = [c.content for c in new_chunks]
         vectors = embed_texts(texts)
 
         if self.index is None:
             self._dim = vectors.shape[1]
             self.index = faiss.IndexFlatIP(self._dim)
 
+        start_idx = len(self.chunks)
         self.index.add(vectors)
-        self.chunks.extend(chunks)
-        logger.info("增量添加 %d 条, 总计 %d 条", len(chunks), self.index.ntotal)
+        self.chunks.extend(new_chunks)
+
+        # 更新 source_index
+        for i, chunk in enumerate(new_chunks):
+            idx = start_idx + i
+            self.source_index.setdefault(chunk.source, []).append(idx)
+
+        logger.info("增量添加 %d 条, 总计 %d 条", len(new_chunks), self.index.ntotal)
+
+    # ── 文档管理 ──
+
+    def has_source(self, source: str) -> bool:
+        """检查指定文档是否已索引"""
+        return source in self.source_index
+
+    def remove_source(self, source: str) -> bool:
+        """删除指定文档的所有 chunks 并重建索引"""
+        if source not in self.source_index:
+            return False
+
+        # 保留非该文档的 chunks
+        remaining_chunks = [c for c in self.chunks if c.source != source]
+
+        if remaining_chunks:
+            # 重建索引
+            texts = [c.content for c in remaining_chunks]
+            vectors = embed_texts(texts)
+            self.index = faiss.IndexFlatIP(self._dim or vectors.shape[1])
+            self.index.add(vectors)
+        else:
+            self.index = None
+
+        self.chunks = remaining_chunks
+        self._rebuild_source_index()
+        self.save()
+        logger.info("已删除文档: %s", source)
+        return True
+
+    def clear(self) -> None:
+        """清空整个索引"""
+        self.index = None
+        self.chunks = []
+        self.source_index = {}
+        self.save()
+        logger.info("索引已清空")
+
+    def get_document_stats(self) -> list[DocumentMeta]:
+        """获取每个已索引文档的统计信息"""
+        stats: dict[str, dict] = {}
+        for chunk in self.chunks:
+            src = chunk.source
+            if src not in stats:
+                stats[src] = {"chunk_count": 0, "total_chars": 0}
+            stats[src]["chunk_count"] += 1
+            stats[src]["total_chars"] += len(chunk.content)
+
+        return [
+            DocumentMeta(source=s, chunk_count=d["chunk_count"], total_chars=d["total_chars"])
+            for s, d in stats.items()
+        ]
+
+    def get_sources(self) -> list[str]:
+        """获取所有已索引文档名称"""
+        return list(self.source_index.keys())
 
     # ── 检索 ──
 
@@ -92,6 +172,9 @@ class VectorStore:
         with open(dir_path / "chunks.pkl", "wb") as f:
             pickle.dump(self.chunks, f)
 
+        with open(dir_path / "source_index.pkl", "wb") as f:
+            pickle.dump(self.source_index, f)
+
         logger.info("索引已保存到 %s", dir_path)
 
     def load(self, dir_path: str | Path | None = None) -> bool:
@@ -109,11 +192,28 @@ class VectorStore:
             with open(chunks_file, "rb") as f:
                 self.chunks = pickle.load(f)
             self._dim = self.index.d
+
+            # 加载 source_index（兼容旧版本没有此文件的情况）
+            source_index_file = dir_path / "source_index.pkl"
+            if source_index_file.exists():
+                with open(source_index_file, "rb") as f:
+                    self.source_index = pickle.load(f)
+            else:
+                self._rebuild_source_index()
+
             logger.info("索引已加载: %d 条", self.index.ntotal)
             return True
         except Exception as e:
             logger.error("加载索引失败: %s", e)
             return False
+
+    # ── 内部方法 ──
+
+    def _rebuild_source_index(self) -> None:
+        """从 chunks 重建 source_index"""
+        self.source_index = {}
+        for i, chunk in enumerate(self.chunks):
+            self.source_index.setdefault(chunk.source, []).append(i)
 
     @property
     def total_chunks(self) -> int:

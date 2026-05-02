@@ -1,9 +1,10 @@
-"""DocMind Streamlit 前端界面"""
+"""DocMind Streamlit 前端 — 生产级 RAG 文档智能助手"""
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
-import time
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -14,10 +15,14 @@ from docmind.vector_store import VectorStore
 from docmind.rag_engine import RAGEngine
 from docmind.summarizer import Summarizer
 from docmind.extractor import Extractor
+from docmind.chat_history import ChatHistoryManager
+from docmind.exporter import Exporter
 
 logger = logging.getLogger(__name__)
 
-# ── 页面配置 ──
+# ══════════════════════════════════════════════
+# 页面配置
+# ══════════════════════════════════════════════
 
 st.set_page_config(
     page_title="DocMind - AI 文档智能助手",
@@ -26,156 +31,262 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── 自定义样式 ──
+# ══════════════════════════════════════════════
+# 自定义样式
+# ══════════════════════════════════════════════
 
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2rem;
-        font-weight: 700;
+    .main-header { font-size: 1.8rem; font-weight: 700;
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    .stat-card {
-        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-        padding: 1rem;
-        border-radius: 0.5rem;
-        text-align: center;
-    }
-    .source-badge {
-        display: inline-block;
-        background: #e8f0fe;
-        color: #1a73e8;
-        padding: 0.2rem 0.6rem;
-        border-radius: 1rem;
-        font-size: 0.8rem;
-        margin: 0.2rem;
-    }
-    .chat-message-user {
-        background: #f0f4ff;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin-bottom: 0.5rem;
-    }
-    .chat-message-assistant {
-        background: #f8f9fa;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin-bottom: 0.5rem;
-    }
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .doc-card { background: #f8f9fa; border-radius: 8px; padding: 0.8rem;
+        margin-bottom: 0.5rem; border-left: 3px solid #667eea; }
+    .doc-card-title { font-weight: 600; font-size: 0.95rem; color: #1a1a2e; }
+    .doc-card-meta { font-size: 0.8rem; color: #666; }
+    .source-badge { display: inline-block; background: #e8f0fe; color: #1a73e8;
+        padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.85rem; margin: 0.1rem; }
+    .score-badge { display: inline-block; background: #e6f4ea; color: #137333;
+        padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.8rem; }
+    .risk-card { background: #fef7e0; border-left: 3px solid #f9ab00;
+        padding: 0.6rem; border-radius: 4px; margin-bottom: 0.3rem; }
+    .rec-card { background: #e6f4ea; border-left: 3px solid #137333;
+        padding: 0.6rem; border-radius: 4px; margin-bottom: 0.3rem; }
+    .keyword-tag { display: inline-block; background: #fce4ec; color: #c62828;
+        padding: 0.15rem 0.5rem; border-radius: 12px; font-size: 0.8rem; margin: 0.1rem; }
+    .welcome-icon { font-size: 4rem; text-align: center; }
+    .stat-number { font-size: 1.5rem; font-weight: 700; color: #667eea; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Session State 初始化 ──
+# ══════════════════════════════════════════════
+# Session State
+# ══════════════════════════════════════════════
 
 def init_state():
     """初始化会话状态"""
     if "rag_engine" not in st.session_state:
         store = VectorStore()
-        # 尝试加载已有索引
         store.load()
         st.session_state.rag_engine = RAGEngine(store)
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
-    if "uploaded_files" not in st.session_state:
-        st.session_state.uploaded_files = []
     if "summaries" not in st.session_state:
         st.session_state.summaries = {}
     if "extractions" not in st.session_state:
         st.session_state.extractions = {}
+    if "conversation_id" not in st.session_state:
+        st.session_state.conversation_id = None
+    if "settings" not in st.session_state:
+        st.session_state.settings = {
+            "top_k": Config.TOP_K,
+            "temperature": 0.2,
+        }
 
 
 init_state()
 
 
-# ── 侧边栏 ──
+# ══════════════════════════════════════════════
+# 辅助函数
+# ══════════════════════════════════════════════
+
+def get_engine() -> RAGEngine:
+    return st.session_state.rag_engine
+
+
+def format_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+# ══════════════════════════════════════════════
+# 侧边栏
+# ══════════════════════════════════════════════
 
 with st.sidebar:
+    # ── 标题 ──
     st.markdown('<p class="main-header">📄 DocMind</p>', unsafe_allow_html=True)
     st.caption("AI 文档智能助手 · Powered by MiMo")
-
     st.divider()
 
-    # 文档上传
+    # ── 文档上传 ──
     st.subheader("📤 上传文档")
     uploaded_files = st.file_uploader(
         "支持 PDF / TXT / MD / DOCX",
         type=["pdf", "txt", "md", "docx"],
         accept_multiple_files=True,
-        help="可同时上传多个文档",
+        help="可同时上传多个文档，单文件最大 50MB",
+        key="file_uploader",
     )
 
     if uploaded_files:
         if st.button("🔄 索引文档", use_container_width=True, type="primary"):
-            with st.spinner("正在解析和索引文档..."):
-                progress = st.progress(0)
-                total_chunks = 0
+            engine = get_engine()
+            new_count = 0
+            skip_count = 0
+            error_count = 0
 
-                for i, file in enumerate(uploaded_files):
-                    # 保存上传文件到临时目录
-                    suffix = Path(file.name).suffix
+            progress = st.progress(0, text="解析和索引文档...")
+
+            for i, file in enumerate(uploaded_files):
+                # 文件大小校验
+                file_size = len(file.getbuffer())
+                if file_size > Config.MAX_FILE_SIZE_MB * 1024 * 1024:
+                    st.warning(f"⚠️ {file.name} 超过 {Config.MAX_FILE_SIZE_MB}MB 限制，已跳过")
+                    error_count += 1
+                    progress.progress((i + 1) / len(uploaded_files))
+                    continue
+
+                # 去重检查
+                if engine.store.has_source(file.name):
+                    skip_count += 1
+                    progress.progress((i + 1) / len(uploaded_files))
+                    continue
+
+                # 保存临时文件
+                suffix = Path(file.name).suffix
+                tmp_path = None
+                try:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=str(Config.UPLOAD_DIR)) as tmp:
                         tmp.write(file.getbuffer())
                         tmp_path = tmp.name
 
-                    try:
-                        chunks = parse_document(tmp_path)
-                        st.session_state.rag_engine.store.add_chunks(chunks)
-                        total_chunks += len(chunks)
-                        st.session_state.uploaded_files.append(file.name)
-                    except Exception as e:
-                        st.error(f"解析失败 {file.name}: {e}")
+                    chunks = parse_document(tmp_path)
+                    engine.store.add_chunks(chunks)
+                    new_count += len(chunks)
+                except Exception as e:
+                    st.error(f"解析失败 {file.name}: {e}")
+                    error_count += 1
+                finally:
+                    # 清理临时文件
+                    if tmp_path and Config.TEMP_CLEANUP:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
 
-                    progress.progress((i + 1) / len(uploaded_files))
+                progress.progress((i + 1) / len(uploaded_files))
 
-                st.session_state.rag_engine.store.save()
-                st.success(f"✅ 索引完成！共 {total_chunks} 个文本块")
+            engine.store.save()
 
-    # 已索引文档
+            # 结果提示
+            msg_parts = []
+            if new_count > 0:
+                msg_parts.append(f"新增 {new_count} 个文本块")
+            if skip_count > 0:
+                msg_parts.append(f"跳过 {skip_count} 个已索引文档")
+            if error_count > 0:
+                msg_parts.append(f"{error_count} 个文件失败")
+            if msg_parts:
+                st.success("✅ " + "，".join(msg_parts))
+
+    # ── 文档库 ──
     st.divider()
-    st.subheader("📚 已索引文档")
-    engine = st.session_state.rag_engine
+    st.subheader("📚 文档库")
+    engine = get_engine()
+
     if engine.store.is_empty:
         st.info("暂无文档，请先上传")
     else:
         st.metric("索引文本块", engine.store.total_chunks)
-        sources = list(set(c.source for c in engine.store.chunks))
-        for src in sources:
-            chunk_count = sum(1 for c in engine.store.chunks if c.source == src)
-            st.markdown(f"- **{src}** ({chunk_count} 块)")
+        stats = engine.store.get_document_stats()
+        for doc_stat in stats:
+            with st.container():
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    st.markdown(
+                        f'<div class="doc-card">'
+                        f'<div class="doc-card-title">📄 {doc_stat.source}</div>'
+                        f'<div class="doc-card-meta">{doc_stat.chunk_count} 块 · '
+                        f'{doc_stat.total_chars:,} 字</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                with col2:
+                    if st.button("🗑️", key=f"del_{doc_stat.source}", help=f"删除 {doc_stat.source}"):
+                        if engine.store.remove_source(doc_stat.source):
+                            st.rerun()
 
-    # 功能选项
+        if st.button("🗑️ 清空全部", key="clear_all", use_container_width=True):
+            engine.store.clear()
+            st.session_state.chat_history = []
+            st.rerun()
+
+    # ── 设置 ──
     st.divider()
-    st.subheader("🛠️ 工具箱")
-    tool = st.radio(
-        "选择功能",
-        ["💬 智能问答", "📝 文档摘要", "🔍 信息提取", "📊 文档对比"],
-        label_visibility="collapsed",
-    )
+    with st.expander("⚙️ 参数设置"):
+        settings = st.session_state.settings
+        settings["top_k"] = st.slider("检索数量 (Top-K)", 1, 10, settings["top_k"], key="slider_topk")
+        settings["temperature"] = st.slider(
+            "生成温度", 0.0, 1.0, settings["temperature"], step=0.1, key="slider_temp"
+        )
+        if st.button("重置默认", key="reset_settings"):
+            st.session_state.settings = {"top_k": Config.TOP_K, "temperature": 0.2}
 
+    # ── 底部信息 ──
     st.divider()
-    st.caption(f"模型: {Config.MIMO_MODEL_PRO} / {Config.MIMO_MODEL_FAST}")
-    st.caption(f"Embedding: {Config.EMBEDDING_MODEL}")
+    st.caption(f"模型: {Config.MIMO_MODEL_PRO}")
+    st.caption(f"Embedding: {Config.EMBEDDING_MODEL.split('/')[-1]}")
 
 
-# ── 主内容区 ──
+# ══════════════════════════════════════════════
+# 主内容区 — 4 个 Tab
+# ══════════════════════════════════════════════
 
-tool_name = tool.split(" ", 1)[1]
+tab_qa, tab_summary, tab_extract, tab_compare = st.tabs(
+    ["💬 智能问答", "📝 文档摘要", "🔍 信息提取", "📊 文档对比"]
+)
 
-# ── 智能问答 ──
+# ──────────────────────────────────────────────
+# Tab 1: 智能问答
+# ──────────────────────────────────────────────
 
-if tool_name == "智能问答":
-    st.header("💬 智能问答")
+with tab_qa:
+    engine = get_engine()
 
     if engine.store.is_empty:
-        st.warning("请先在侧边栏上传文档并索引，才能进行问答。")
+        # 欢迎页
+        st.markdown("""
+        <div style="text-align: center; padding: 3rem;">
+            <div class="welcome-icon">📄</div>
+            <h2>欢迎使用 DocMind</h2>
+            <p style="color: #666; font-size: 1.1rem;">上传文档后，即可开始智能问答</p>
+        </div>
+        """, unsafe_allow_html=True)
     else:
+        # 顶部工具栏
+        col_toolbar1, col_toolbar2, col_toolbar3 = st.columns([3, 1, 1])
+        with col_toolbar2:
+            if st.button("🗑️ 清空对话", key="clear_chat"):
+                st.session_state.chat_history = []
+                st.rerun()
+        with col_toolbar3:
+            # 导出对话
+            if st.session_state.chat_history:
+                exporter = Exporter()
+                content, filename = exporter.chat_to_markdown(st.session_state.chat_history)
+                st.download_button("📥 导出", content, filename, mime="text/markdown", key="export_chat")
+
         # 显示聊天历史
         for msg in st.session_state.chat_history:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
+                # 展示来源引用
+                if msg["role"] == "assistant" and msg.get("sources"):
+                    with st.expander(f"📎 参考来源 ({len(msg['sources'])} 个片段)"):
+                        for j, src in enumerate(msg["sources"]):
+                            st.markdown(
+                                f"**片段 {j+1}** <span class='source-badge'>{src['source']}</span> "
+                                f"<span class='score-badge'>相关度 {src['score']:.3f}</span>",
+                                unsafe_allow_html=True,
+                            )
+                            st.caption(src["preview"])
 
         # 输入框
         if query := st.chat_input("基于文档内容提问..."):
@@ -184,44 +295,85 @@ if tool_name == "智能问答":
             with st.chat_message("user"):
                 st.markdown(query)
 
-            # AI 回复（流式）
+            # AI 回复（流式 + 来源）
             with st.chat_message("assistant"):
+                settings = st.session_state.settings
+                stream_gen, sources = engine.ask_with_sources(
+                    query,
+                    top_k=settings["top_k"],
+                    chat_history=st.session_state.chat_history[:-1],  # 排除刚加的用户消息
+                )
+
                 response_placeholder = st.empty()
                 full_response = ""
 
-                for token in engine.ask_stream(query):
+                for token in stream_gen:
                     full_response += token
                     response_placeholder.markdown(full_response + "▌")
 
                 response_placeholder.markdown(full_response)
 
-            st.session_state.chat_history.append({"role": "assistant", "content": full_response})
+                # 显示来源
+                if sources:
+                    with st.expander(f"📎 参考来源 ({len(sources)} 个片段)"):
+                        for j, src in enumerate(sources):
+                            st.markdown(
+                                f"**片段 {j+1}** <span class='source-badge'>{src['source']}</span> "
+                                f"<span class='score-badge'>相关度 {src['score']:.3f}</span>",
+                                unsafe_allow_html=True,
+                            )
+                            st.caption(src["preview"])
 
-# ── 文档摘要 ──
+            # 保存到聊天历史（含来源）
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": full_response,
+                "sources": sources,
+            })
 
-elif tool_name == "文档摘要":
-    st.header("📝 文档摘要")
+            # 持久化对话
+            try:
+                history_mgr = ChatHistoryManager()
+                conv_id = history_mgr.save_conversation(
+                    st.session_state.chat_history,
+                    st.session_state.conversation_id,
+                )
+                st.session_state.conversation_id = conv_id
+            except Exception:
+                pass  # 持久化失败不影响使用
+
+
+# ──────────────────────────────────────────────
+# Tab 2: 文档摘要
+# ──────────────────────────────────────────────
+
+with tab_summary:
+    engine = get_engine()
 
     if engine.store.is_empty:
-        st.warning("请先上传文档。")
+        st.info("请先上传文档。")
     else:
-        col1, col2 = st.columns([1, 2])
+        col_s1, col_s2 = st.columns([1, 2])
 
-        with col1:
-            style = st.selectbox("摘要风格", ["详细 (detailed)", "简短 (brief)", "学术 (academic)"])
-            style_key = style.split("(")[1].rstrip(")")
+        with col_s1:
+            sources = engine.store.get_sources()
+            selected_source = st.selectbox("选择文档", sources, key="summary_source")
 
-            sources = list(set(c.source for c in engine.store.chunks))
-            selected_source = st.selectbox("选择文档", sources)
+            style = st.selectbox("摘要风格", ["详细", "简短", "学术"], key="summary_style")
+            style_map = {"详细": "detailed", "简短": "brief", "学术": "academic"}
+            style_key = style_map[style]
 
-            if st.button("生成摘要", type="primary", use_container_width=True):
+            if st.button("生成摘要", type="primary", use_container_width=True, key="gen_summary"):
                 with st.spinner("正在生成摘要..."):
-                    chunks = [c for c in engine.store.chunks if c.source == selected_source]
-                    summarizer = Summarizer()
-                    result = summarizer.summarize(chunks, style=style_key)
-                    st.session_state.summaries[selected_source] = result
+                    try:
+                        chunks = [c for c in engine.store.chunks if c.source == selected_source]
+                        summarizer = Summarizer()
+                        result = summarizer.summarize(chunks, style=style_key)
+                        st.session_state.summaries[selected_source] = result
+                    except Exception as e:
+                        st.error(f"摘要生成失败: {e}")
 
-        with col2:
+        with col_s2:
             if selected_source in st.session_state.summaries:
                 result = st.session_state.summaries[selected_source]
 
@@ -235,28 +387,48 @@ elif tool_name == "文档摘要":
 
                 if result.get("keywords"):
                     st.subheader("🏷️ 关键词")
-                    st.markdown(" | ".join([f"`{k}`" for k in result["keywords"]]))
+                    st.markdown(" ".join([f"`{k}`" for k in result["keywords"]]))
 
                 if result.get("doc_type"):
                     st.caption(f"文档类型: {result['doc_type']}")
 
-# ── 信息提取 ──
+                # 导出
+                st.divider()
+                exporter = Exporter()
+                col_e1, col_e2, col_e3 = st.columns(3)
+                with col_e1:
+                    json_content, json_name = exporter.to_json(result)
+                    st.download_button("📥 JSON", json_content, json_name, "application/json", key="dl_summary_json")
+                with col_e2:
+                    txt_content, txt_name = exporter.to_text(result, f"{selected_source} 摘要")
+                    st.download_button("📥 TXT", txt_content, txt_name, "text/plain", key="dl_summary_txt")
+                with col_e3:
+                    md_content, md_name = exporter.summary_to_markdown(result, selected_source)
+                    st.download_button("📥 Markdown", md_content, md_name, "text/markdown", key="dl_summary_md")
 
-elif tool_name == "信息提取":
-    st.header("🔍 关键信息提取")
+
+# ──────────────────────────────────────────────
+# Tab 3: 信息提取
+# ──────────────────────────────────────────────
+
+with tab_extract:
+    engine = get_engine()
 
     if engine.store.is_empty:
-        st.warning("请先上传文档。")
+        st.info("请先上传文档。")
     else:
-        sources = list(set(c.source for c in engine.store.chunks))
+        sources = engine.store.get_sources()
         selected_source = st.selectbox("选择文档", sources, key="extract_source")
 
-        if st.button("提取信息", type="primary"):
+        if st.button("提取信息", type="primary", key="gen_extract"):
             with st.spinner("正在提取关键信息..."):
-                chunks = [c for c in engine.store.chunks if c.source == selected_source]
-                extractor = Extractor()
-                result = extractor.extract(chunks)
-                st.session_state.extractions[selected_source] = result
+                try:
+                    chunks = [c for c in engine.store.chunks if c.source == selected_source]
+                    extractor = Extractor()
+                    result = extractor.extract(chunks)
+                    st.session_state.extractions[selected_source] = result
+                except Exception as e:
+                    st.error(f"信息提取失败: {e}")
 
         if selected_source in st.session_state.extractions:
             result = st.session_state.extractions[selected_source]
@@ -265,29 +437,29 @@ elif tool_name == "信息提取":
             entities = result.get("entities", {})
             if any(entities.get(k) for k in ["people", "organizations", "locations", "dates"]):
                 st.subheader("👤 实体")
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
+                e_col1, e_col2, e_col3, e_col4 = st.columns(4)
+                with e_col1:
                     st.markdown("**人物**")
-                    for p in entities.get("people", [])[:5]:
+                    for p in entities.get("people", [])[:8]:
                         st.markdown(f"- {p}")
-                with col2:
+                with e_col2:
                     st.markdown("**机构**")
-                    for o in entities.get("organizations", [])[:5]:
+                    for o in entities.get("organizations", [])[:8]:
                         st.markdown(f"- {o}")
-                with col3:
+                with e_col3:
                     st.markdown("**地点**")
-                    for l in entities.get("locations", [])[:5]:
+                    for l in entities.get("locations", [])[:8]:
                         st.markdown(f"- {l}")
-                with col4:
+                with e_col4:
                     st.markdown("**日期**")
-                    for d in entities.get("dates", [])[:5]:
+                    for d in entities.get("dates", [])[:8]:
                         st.markdown(f"- {d}")
 
             # 数据
             numbers = result.get("numbers", [])
             if numbers:
                 st.subheader("📊 关键数据")
-                for n in numbers[:10]:
+                for n in numbers[:15]:
                     st.markdown(f"- **{n.get('value', '')}** {n.get('unit', '')} — {n.get('context', '')}")
 
             # 结论
@@ -302,59 +474,95 @@ elif tool_name == "信息提取":
             if risks:
                 st.subheader("⚠️ 风险与挑战")
                 for r in risks:
-                    st.markdown(f"- {r}")
+                    st.markdown(f'<div class="risk-card">⚠️ {r}</div>', unsafe_allow_html=True)
 
             # 建议
             recommendations = result.get("recommendations", [])
             if recommendations:
                 st.subheader("✅ 建议")
                 for r in recommendations:
-                    st.markdown(f"- {r}")
+                    st.markdown(f'<div class="rec-card">✅ {r}</div>', unsafe_allow_html=True)
 
-# ── 文档对比 ──
+            # 导出
+            st.divider()
+            exporter = Exporter()
+            col_ex1, col_ex2 = st.columns(2)
+            with col_ex1:
+                json_content, json_name = exporter.to_json(result)
+                st.download_button("📥 JSON", json_content, json_name, "application/json", key="dl_extract_json")
+            with col_ex2:
+                txt_content, txt_name = exporter.to_text(result, f"{selected_source} 信息提取")
+                st.download_button("📥 TXT", txt_content, txt_name, "text/plain", key="dl_extract_txt")
 
-elif tool_name == "文档对比":
-    st.header("📊 文档对比")
+
+# ──────────────────────────────────────────────
+# Tab 4: 文档对比
+# ──────────────────────────────────────────────
+
+with tab_compare:
+    engine = get_engine()
 
     if engine.store.is_empty:
-        st.warning("请先上传至少两个文档。")
+        st.info("请先上传文档。")
     else:
-        sources = list(set(c.source for c in engine.store.chunks))
+        sources = engine.store.get_sources()
         if len(sources) < 2:
             st.warning("至少需要 2 个文档才能进行对比。")
         else:
-            col1, col2 = st.columns(2)
-            with col1:
-                doc_a = st.selectbox("文档 A", sources, key="compare_a")
-            with col2:
-                doc_b = st.selectbox("文档 B", [s for s in sources if s != doc_a], key="compare_b")
+            c_col1, c_col2 = st.columns(2)
+            with c_col1:
+                doc_a = st.selectbox("文档 A", sources, key="compare_doc_a")
+            with c_col2:
+                remaining = [s for s in sources if s != doc_a]
+                doc_b = st.selectbox("文档 B", remaining or sources, key="compare_doc_b")
 
-            if st.button("开始对比", type="primary"):
+            if st.button("开始对比", type="primary", key="gen_compare"):
                 with st.spinner("正在对比分析..."):
-                    chunks_a = [c for c in engine.store.chunks if c.source == doc_a]
-                    chunks_b = [c for c in engine.store.chunks if c.source == doc_b]
-                    extractor = Extractor()
-                    result = extractor.compare_documents(chunks_a, chunks_b, doc_a, doc_b)
+                    try:
+                        chunks_a = [c for c in engine.store.chunks if c.source == doc_a]
+                        chunks_b = [c for c in engine.store.chunks if c.source == doc_b]
+                        extractor = Extractor()
+                        result = extractor.compare_documents(chunks_a, chunks_b, doc_a, doc_b)
+                        st.session_state.compare_result = result
+                        st.session_state.compare_docs = (doc_a, doc_b)
+                    except Exception as e:
+                        st.error(f"对比分析失败: {e}")
 
-                    # 显示结果
+            if "compare_result" in st.session_state:
+                result = st.session_state.compare_result
+
+                # 共同点
+                common = result.get("common_points", [])
+                if common:
                     st.subheader("🤝 共同点")
-                    for cp in result.get("common_points", []):
+                    for cp in common:
                         st.markdown(f"- {cp}")
 
+                # 差异
+                diffs = result.get("differences", [])
+                if diffs:
                     st.subheader("🔄 差异")
-                    diffs = result.get("differences", [])
-                    if diffs:
-                        st.table(diffs)
+                    st.table(diffs)
 
+                # 结论
+                conclusion = result.get("conclusion", "")
+                if conclusion:
                     st.subheader("📋 结论")
-                    st.markdown(result.get("conclusion", ""))
+                    st.markdown(conclusion)
+
+                # 导出
+                st.divider()
+                exporter = Exporter()
+                json_content, json_name = exporter.to_json(result)
+                st.download_button("📥 导出对比结果 (JSON)", json_content, json_name, "application/json", key="dl_compare")
 
 
-# ── 入口 ──
+# ══════════════════════════════════════════════
+# 入口
+# ══════════════════════════════════════════════
 
 def main():
-    """Streamlit 入口"""
-    pass  # Streamlit 自动执行模块级代码
+    pass
 
 
 if __name__ == "__main__":

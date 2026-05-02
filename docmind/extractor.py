@@ -126,8 +126,8 @@ class Extractor:
 
     def compare_documents(self, chunks_a: list[Chunk], chunks_b: list[Chunk], name_a: str = "文档A", name_b: str = "文档B") -> dict:
         """对比两个文档的异同"""
-        text_a = "\n".join([c.content for c in chunks_a[:5]])[:3000]
-        text_b = "\n".join([c.content for c in chunks_b[:5]])[:3000]
+        text_a = "\n".join([c.content for c in chunks_a[:10]])[:5000]
+        text_b = "\n".join([c.content for c in chunks_b[:10]])[:5000]
 
         system_prompt = f"""你是文档对比分析专家。请对比以下两个文档，找出异同点。
 
