@@ -15,8 +15,10 @@ from docmind.vector_store import VectorStore
 from docmind.rag_engine import RAGEngine
 from docmind.summarizer import Summarizer
 from docmind.extractor import Extractor
+from docmind.knowledge_graph import KnowledgeGraphBuilder
 from docmind.chat_history import ChatHistoryManager
 from docmind.exporter import Exporter
+from docmind.auth import UserStore, create_access_token, verify_jwt, get_user_index_dir
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +68,12 @@ st.markdown("""
 
 def init_state():
     """初始化会话状态"""
-    if "rag_engine" not in st.session_state:
-        store = VectorStore()
-        store.load()
-        st.session_state.rag_engine = RAGEngine(store)
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if "current_user" not in st.session_state:
+        st.session_state.current_user = None
+    if "rag_engine" not in st.session_state and st.session_state.authenticated:
+        _init_user_engine()
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
     if "summaries" not in st.session_state:
@@ -85,7 +89,94 @@ def init_state():
         }
 
 
+def _init_user_engine():
+    """根据当前用户初始化 RAG 引擎（per-user FAISS 隔离）"""
+    username = st.session_state.current_user
+    if username:
+        index_dir = get_user_index_dir(username)
+        store = VectorStore()
+        store.load(dir_path=index_dir)
+    else:
+        store = VectorStore()
+        store.load()
+    st.session_state.rag_engine = RAGEngine(store)
+
+
 init_state()
+
+# ══════════════════════════════════════════════
+# 登录 / 注册页面
+# ══════════════════════════════════════════════
+
+def show_login_page():
+    """显示登录/注册页面"""
+    st.markdown("""
+    <div style="text-align: center; padding: 2rem 0;">
+        <div style="font-size: 4rem;">📄</div>
+        <h1 style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+            DocMind
+        </h1>
+        <p style="color: #666; font-size: 1.1rem;">AI 文档智能助手 · 请登录以继续</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    tab_login, tab_register = st.tabs(["🔑 登录", "📝 注册"])
+
+    with tab_login:
+        with st.form("login_form"):
+            username = st.text_input("用户名", key="login_user")
+            password = st.text_input("密码", type="password", key="login_pass")
+            submitted = st.form_submit_button("登录", use_container_width=True, type="primary")
+
+            if submitted:
+                if not username or not password:
+                    st.error("请输入用户名和密码")
+                else:
+                    user_store = UserStore()
+                    user = user_store.verify_user(username, password)
+                    if user:
+                        st.session_state.authenticated = True
+                        st.session_state.current_user = username
+                        _init_user_engine()
+                        st.success(f"欢迎回来，{username}！")
+                        st.rerun()
+                    else:
+                        st.error("用户名或密码错误")
+
+    with tab_register:
+        with st.form("register_form"):
+            new_user = st.text_input("用户名", key="reg_user")
+            new_pass = st.text_input("密码", type="password", key="reg_pass")
+            new_pass2 = st.text_input("确认密码", type="password", key="reg_pass2")
+            submitted = st.form_submit_button("注册", use_container_width=True)
+
+            if submitted:
+                if not new_user or not new_pass:
+                    st.error("请输入用户名和密码")
+                elif new_pass != new_pass2:
+                    st.error("两次密码不一致")
+                elif len(new_user) < 2:
+                    st.error("用户名至少 2 个字符")
+                elif len(new_pass) < 4:
+                    st.error("密码至少 4 个字符")
+                else:
+                    user_store = UserStore()
+                    user = user_store.create_user(new_user, new_pass)
+                    if user:
+                        st.session_state.authenticated = True
+                        st.session_state.current_user = new_user
+                        _init_user_engine()
+                        st.success(f"注册成功！欢迎，{new_user}！")
+                        st.rerun()
+                    else:
+                        st.error("用户名已存在")
+
+
+# 未登录则显示登录页，登录后才显示主界面
+if not st.session_state.authenticated:
+    show_login_page()
+    st.stop()
 
 
 # ══════════════════════════════════════════════
@@ -94,6 +185,13 @@ init_state()
 
 def get_engine() -> RAGEngine:
     return st.session_state.rag_engine
+
+
+def _current_user_index_dir() -> Path | None:
+    """获取当前用户的专属索引目录"""
+    if st.session_state.current_user:
+        return get_user_index_dir(st.session_state.current_user)
+    return None
 
 
 def format_size(size_bytes: int) -> str:
@@ -118,8 +216,8 @@ with st.sidebar:
     # ── 文档上传 ──
     st.subheader("📤 上传文档")
     uploaded_files = st.file_uploader(
-        "支持 PDF / TXT / MD / DOCX",
-        type=["pdf", "txt", "md", "docx"],
+        "支持 PDF / TXT / MD / DOCX / XLSX / XLS / PPTX",
+        type=["pdf", "txt", "md", "docx", "xlsx", "xls", "pptx"],
         accept_multiple_files=True,
         help="可同时上传多个文档，单文件最大 50MB",
         key="file_uploader",
@@ -173,7 +271,8 @@ with st.sidebar:
 
                 progress.progress((i + 1) / len(uploaded_files))
 
-            engine.store.save()
+            user_dir = _current_user_index_dir()
+            engine.store.save(dir_path=user_dir)
 
             # 结果提示
             msg_parts = []
@@ -231,6 +330,12 @@ with st.sidebar:
 
     # ── 底部信息 ──
     st.divider()
+    st.caption(f"👤 {st.session_state.current_user}")
+    if st.button("🚪 退出登录", use_container_width=True, key="logout"):
+        st.session_state.authenticated = False
+        st.session_state.current_user = None
+        st.session_state.rag_engine = None
+        st.rerun()
     st.caption(f"模型: {Config.MIMO_MODEL_PRO}")
     st.caption(f"Embedding: {Config.EMBEDDING_MODEL.split('/')[-1]}")
 
@@ -239,8 +344,8 @@ with st.sidebar:
 # 主内容区 — 4 个 Tab
 # ══════════════════════════════════════════════
 
-tab_qa, tab_summary, tab_extract, tab_compare = st.tabs(
-    ["💬 智能问答", "📝 文档摘要", "🔍 信息提取", "📊 文档对比"]
+tab_qa, tab_summary, tab_extract, tab_compare, tab_graph = st.tabs(
+    ["💬 智能问答", "📝 文档摘要", "🔍 信息提取", "📊 文档对比", "🕸️ 知识图谱"]
 )
 
 # ──────────────────────────────────────────────
@@ -555,6 +660,126 @@ with tab_compare:
                 exporter = Exporter()
                 json_content, json_name = exporter.to_json(result)
                 st.download_button("📥 导出对比结果 (JSON)", json_content, json_name, "application/json", key="dl_compare")
+
+
+# ──────────────────────────────────────────────
+# Tab 5: 知识图谱
+# ──────────────────────────────────────────────
+
+with tab_graph:
+    engine = get_engine()
+
+    if engine.store.is_empty:
+        st.info("请先上传文档。")
+    else:
+        sources = engine.store.get_sources()
+        selected_source = st.selectbox(
+            "选择文档", ["全部文档"] + sources, key="graph_source"
+        )
+
+        max_chunks = st.slider("最大分析块数", 5, 30, 15, key="graph_max_chunks",
+                               help="块数越多图谱越完整，但耗时更长")
+
+        if st.button("🕸️ 构建知识图谱", type="primary", use_container_width=True, key="gen_graph"):
+            with st.spinner("正在构建知识图谱（LLM 提取实体与关系）..."):
+                try:
+                    if selected_source == "全部文档":
+                        chunks = engine.store.chunks
+                    else:
+                        chunks = [c for c in engine.store.chunks if c.source == selected_source]
+
+                    builder = KnowledgeGraphBuilder()
+                    kg = builder.build(chunks, max_chunks=max_chunks)
+                    st.session_state.knowledge_graph = kg
+                except Exception as e:
+                    st.error(f"图谱构建失败: {e}")
+
+        if "knowledge_graph" in st.session_state:
+            kg = st.session_state.knowledge_graph
+
+            # 统计
+            col_g1, col_g2, col_g3 = st.columns(3)
+            with col_g1:
+                st.metric("节点数", len(kg.nodes))
+            with col_g2:
+                st.metric("关系数", len(kg.edges))
+            with col_g3:
+                categories = set(n.category for n in kg.nodes)
+                st.metric("实体类别", len(categories))
+
+            # 图例
+            if categories:
+                legend_html = " ".join([
+                    f'<span style="background:{_category_color_fn(c)};color:white;'
+                    f'padding:0.15rem 0.5rem;border-radius:4px;font-size:0.8rem;margin:0.1rem;">{c}</span>'
+                    for c in sorted(categories)
+                ])
+                st.markdown(f"**图例**: {legend_html}", unsafe_allow_html=True)
+
+            # 渲染图谱
+            if kg.nodes:
+                try:
+                    from streamlit_agraph import agraph, Config as AGraphConfig, Node, Edge
+
+                    agraph_nodes = [
+                        Node(
+                            id=n.id,
+                            label=n.label,
+                            size=n.size,
+                            color=n.color if hasattr(n, "color") else _category_color_fn(n.category),
+                        )
+                        for n in kg.nodes
+                    ]
+                    agraph_edges = [
+                        Edge(source=e.source, target=e.target, label=e.label)
+                        for e in kg.edges
+                    ]
+
+                    agraph_config = AGraphConfig(
+                        width=900,
+                        height=600,
+                        directed=True,
+                        physics=True,
+                        hierarchical=False,
+                    )
+
+                    agraph(nodes=agraph_nodes, edges=agraph_edges, config=agraph_config)
+
+                except ImportError:
+                    # 降级：表格展示
+                    st.warning("未安装 streamlit-agraph，以表格形式展示图谱")
+
+                    st.subheader("节点列表")
+                    node_data = [{"ID": n.id, "名称": n.label, "类别": n.category, "连接数": n.size} for n in kg.nodes]
+                    st.dataframe(node_data, use_container_width=True)
+
+                    st.subheader("关系列表")
+                    edge_data = [{"源": e.source, "目标": e.target, "关系": e.label} for e in kg.edges]
+                    st.dataframe(edge_data, use_container_width=True)
+            else:
+                st.info("未从文档中提取到实体和关系。")
+
+            # 导出
+            st.divider()
+            exporter = Exporter()
+            graph_data = kg.to_agraph_data()
+            json_content, json_name = exporter.to_json(graph_data)
+            st.download_button("📥 导出图谱数据 (JSON)", json_content, json_name, "application/json", key="dl_graph")
+
+
+def _category_color_fn(category: str) -> str:
+    """知识图谱节点颜色映射"""
+    colors = {
+        "person": "#e74c3c",
+        "org": "#3498db",
+        "organization": "#3498db",
+        "location": "#2ecc71",
+        "concept": "#9b59b6",
+        "event": "#f39c12",
+        "date": "#1abc9c",
+        "default": "#95a5a6",
+    }
+    return colors.get(category.lower(), colors["default"])
 
 
 # ══════════════════════════════════════════════

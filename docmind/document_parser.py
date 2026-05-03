@@ -1,4 +1,4 @@
-"""文档解析器：支持 PDF / TXT / Markdown / DOCX"""
+"""文档解析器：支持 PDF / TXT / Markdown / DOCX / XLSX / XLS / PPTX"""
 from __future__ import annotations
 
 import logging
@@ -29,7 +29,7 @@ class Chunk:
 class DocumentParser:
     """统一文档解析 + 分块"""
 
-    SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx"}
+    SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".xlsx", ".xls", ".pptx"}
 
     def __init__(self, chunk_size: int | None = None, chunk_overlap: int | None = None):
         self.chunk_size = chunk_size or Config.CHUNK_SIZE
@@ -63,6 +63,9 @@ class DocumentParser:
             ".txt": self._extract_txt,
             ".md": self._extract_txt,
             ".docx": self._extract_docx,
+            ".xlsx": self._extract_excel,
+            ".xls": self._extract_xls,
+            ".pptx": self._extract_ppt,
         }
         return extractors[suffix](path)
 
@@ -86,6 +89,62 @@ class DocumentParser:
         doc = Document(str(path))
         paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
         return "\n\n".join(paragraphs)
+
+    def _extract_excel(self, path: Path) -> str:
+        """提取 Excel (.xlsx) 文件文本，逐 sheet 逐行提取"""
+        from openpyxl import load_workbook
+
+        wb = load_workbook(str(path), read_only=True, data_only=True)
+        parts = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c).strip() for c in row if c is not None]
+                if cells:
+                    rows.append(" | ".join(cells))
+            if rows:
+                parts.append(f"[Sheet: {sheet_name}]\n" + "\n".join(rows))
+        wb.close()
+        return "\n\n".join(parts)
+
+    def _extract_xls(self, path: Path) -> str:
+        """提取旧版 Excel (.xls) 文件文本，逐 sheet 逐行提取"""
+        import xlrd
+
+        wb = xlrd.open_workbook(str(path))
+        parts = []
+        for sheet in wb.sheets():
+            rows = []
+            for row_idx in range(sheet.nrows):
+                cells = [str(sheet.cell_value(row_idx, col_idx)).strip()
+                         for col_idx in range(sheet.ncols)
+                         if str(sheet.cell_value(row_idx, col_idx)).strip()]
+                if cells:
+                    rows.append(" | ".join(cells))
+            if rows:
+                parts.append(f"[Sheet: {sheet.name}]\n" + "\n".join(rows))
+        return "\n\n".join(parts)
+
+    def _extract_ppt(self, path: Path) -> str:
+        """提取 PowerPoint (.pptx) 文件文本，逐 slide 提取"""
+        from pptx import Presentation
+
+        prs = Presentation(str(path))
+        parts = []
+        for i, slide in enumerate(prs.slides):
+            texts = []
+            if slide.shapes.title and slide.shapes.title.text.strip():
+                texts.append(f"标题: {slide.shapes.title.text.strip()}")
+            for shape in slide.shapes:
+                if shape.has_text_frame and shape != slide.shapes.title:
+                    for para in shape.text_frame.paragraphs:
+                        text = para.text.strip()
+                        if text:
+                            texts.append(text)
+            if texts:
+                parts.append(f"[幻灯片 {i+1}]\n" + "\n".join(texts))
+        return "\n\n".join(parts)
 
     # ── 分块策略 ──
 

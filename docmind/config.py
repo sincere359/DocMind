@@ -35,9 +35,17 @@ class Config:
     # ── Cleanup ──
     TEMP_CLEANUP: bool = os.getenv("TEMP_CLEANUP", "true").lower() == "true"
 
-    # ── Server ──
+    # ── Streamlit Server ──
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("PORT", "8501"))
+
+    # ── FastAPI Server ──
+    API_HOST: str = os.getenv("API_HOST", "0.0.0.0")
+    API_PORT: int = int(os.getenv("API_PORT", "8000"))
+
+    # ── JWT (Feature 5: 用户认证) ──
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "docmind-secret-change-me")
+    JWT_EXPIRE_SECONDS: int = int(os.getenv("JWT_EXPIRE_SECONDS", "86400"))  # 24h
 
     @classmethod
     def ensure_dirs(cls):
